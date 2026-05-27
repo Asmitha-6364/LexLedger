@@ -1,6 +1,26 @@
 import argparse
 import hashlib
+import json
+import re
 from pathlib import Path
+
+
+CLAUSE_HEADING_PATTERN = re.compile(
+    r"""
+    ^\s*
+    (?:
+        (?:clause|section|article)\s+
+        (?P<label>[A-Za-z]?\d+(?:\.\d+)*|[IVXLCDM]+|[A-Z])
+        [).:\-]?\s+
+      |
+        (?P<number>\d+(?:\.\d+)*)
+        [).]\s+
+    )
+    (?P<title>[^\n]{3,120})
+    \s*$
+    """,
+    re.IGNORECASE | re.MULTILINE | re.VERBOSE,
+)
 
 
 def sha256_file(path):
@@ -11,6 +31,108 @@ def sha256_file(path):
             digest.update(chunk)
 
     return digest.hexdigest()
+
+
+def sha256_text(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def extract_text_from_pdf(path):
+    errors = []
+
+    try:
+        import pdfplumber
+
+        with pdfplumber.open(path) as pdf:
+            pages = [page.extract_text() or "" for page in pdf.pages]
+        return "\n\n".join(pages)
+    except ImportError:
+        errors.append("pdfplumber is not installed")
+    except Exception as exc:
+        errors.append(f"pdfplumber failed: {exc}")
+
+    try:
+        from PyPDF2 import PdfReader
+
+        reader = PdfReader(str(path))
+        pages = [page.extract_text() or "" for page in reader.pages]
+        return "\n\n".join(pages)
+    except ImportError:
+        errors.append("PyPDF2 is not installed")
+    except Exception as exc:
+        errors.append(f"PyPDF2 failed: {exc}")
+
+    raise RuntimeError(
+        "Could not extract PDF text. Install pdfplumber or PyPDF2, then try again. "
+        f"Details: {'; '.join(errors)}"
+    )
+
+
+def extract_text(path):
+    if path.suffix.lower() == ".pdf":
+        return extract_text_from_pdf(path)
+
+    return path.read_text(encoding="utf-8")
+
+
+def normalize_clause_text(text):
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def slugify(value):
+    slug = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    slug_parts = [part for part in slug.split("_") if part]
+    return "_".join(slug_parts[:8]) or "untitled"
+
+
+def split_into_clauses(text):
+    normalized_text = text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    matches = list(CLAUSE_HEADING_PATTERN.finditer(normalized_text))
+
+    if matches:
+        clauses = []
+        for index, match in enumerate(matches):
+            start = match.start()
+            end = (
+                matches[index + 1].start()
+                if index + 1 < len(matches)
+                else len(normalized_text)
+            )
+            title = match.group("title").strip(" .:-")
+            clause_text = normalize_clause_text(normalized_text[start:end])
+
+            if clause_text:
+                clause_id = f"clause_{index + 1}_{slugify(title)}"
+                clauses.append((clause_id, clause_text))
+
+        return clauses
+
+    paragraphs = [
+        normalize_clause_text(paragraph)
+        for paragraph in re.split(r"\n\s*\n+", normalized_text)
+        if normalize_clause_text(paragraph)
+    ]
+    return [
+        (f"clause_{index}", paragraph)
+        for index, paragraph in enumerate(paragraphs, start=1)
+    ]
+
+
+def build_clause_manifest(contract_path):
+    contract_text = extract_text(contract_path)
+    clauses = split_into_clauses(contract_text)
+
+    if not clauses:
+        raise ValueError("No clause text found in the document.")
+
+    return {clause_id: sha256_text(clause_text) for clause_id, clause_text in clauses}
+
+
+def save_clause_manifest(contract_path, manifest_path):
+    manifest = build_clause_manifest(contract_path)
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    print(f"Saved {len(manifest)} clause hashes to {manifest_path}")
+    return 0
 
 
 def save_hash(file_path, hash_path):
@@ -36,7 +158,7 @@ def verify_hash(file_path, hash_path):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Save and verify a file's SHA-256 hash."
+        description="Save/verify file hashes and build clause-level hash manifests."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -58,6 +180,20 @@ def parse_args():
         help="Hash file to read. Defaults to '<file>.sha256'.",
     )
 
+    manifest_parser = subparsers.add_parser(
+        "manifest", help="Generate a clause-level hash manifest."
+    )
+    manifest_parser.add_argument(
+        "file", type=Path, help="PDF or text contract to process."
+    )
+    manifest_parser.add_argument(
+        "-o",
+        "--manifest-file",
+        type=Path,
+        default=Path("manifest.json"),
+        help="Where to store the manifest. Defaults to 'manifest.json'.",
+    )
+
     return parser.parse_args()
 
 
@@ -73,6 +209,13 @@ def resolve_paths(args):
 
 def main():
     args = parse_args()
+
+    if args.command == "manifest":
+        if not args.file.is_file():
+            raise FileNotFoundError(f"File not found: {args.file}")
+
+        return save_clause_manifest(args.file, args.manifest_file)
+
     file_path, hash_path = resolve_paths(args)
 
     if args.command == "save":
@@ -86,4 +229,8 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        print(f"ERROR: {exc}")
+        raise SystemExit(1)
