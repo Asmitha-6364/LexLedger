@@ -1,6 +1,6 @@
 # LexLedger
 
-Simple contract storage and verification API.
+Simple contract proposal, voting, storage, and verification API.
 
 ## Run PostgreSQL
 
@@ -29,24 +29,79 @@ Open the interactive docs at http://127.0.0.1:8000/docs.
 
 ## Try It
 
-Create a contract:
+On startup the API creates three simulated expert users:
+
+```text
+expert-alice: lexledger-expert-alice-key
+expert-bob:   lexledger-expert-bob-key
+expert-carol: lexledger-expert-carol-key
+```
+
+The approval threshold is 70% of active experts. With three experts, all three
+must approve before a proposed clause is stored and hashed.
+
+Create a single-clause proposal:
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8000/proposal `
+  -H "Content-Type: application/json" `
+  -H "X-API-Key: lexledger-expert-alice-key" `
+  -d "{\"title\":\"Demo proposal\",\"label\":\"payment_terms\",\"text\":\"The buyer shall pay within 30 days.\"}"
+```
+
+Vote on the proposal as each expert:
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8000/proposal/1/vote `
+  -H "Content-Type: application/json" `
+  -H "X-API-Key: lexledger-expert-alice-key" `
+  -d "{\"choice\":\"approve\"}"
+
+curl.exe -X POST http://127.0.0.1:8000/proposal/1/vote `
+  -H "Content-Type: application/json" `
+  -H "X-API-Key: lexledger-expert-bob-key" `
+  -d "{\"choice\":\"approve\"}"
+
+curl.exe -X POST http://127.0.0.1:8000/proposal/1/vote `
+  -H "Content-Type: application/json" `
+  -H "X-API-Key: lexledger-expert-carol-key" `
+  -d "{\"choice\":\"approve\"}"
+```
+
+Fetch the approved proposal. It will include `status: "approved"` and a
+`stored_clause_id`:
+
+```powershell
+curl.exe http://127.0.0.1:8000/proposal/1
+```
+
+Fetch and verify the stored clause:
+
+```powershell
+curl.exe http://127.0.0.1:8000/clause/1
+```
+
+Create a full contract. Its clauses become pending proposals first; they are not
+stored in the `clauses` table until voting approves them:
 
 ```powershell
 curl.exe -X POST http://127.0.0.1:8000/contract `
   -H "Content-Type: application/json" `
+  -H "X-API-Key: lexledger-expert-alice-key" `
   -d "{\"title\":\"Demo contract\",\"text\":\"1. Payment Terms`nThe buyer shall pay within 30 days.`n`n2. Termination`nEither party may terminate with written notice.\"}"
 ```
 
-Fetch and verify the full contract:
+Fetch a full contract, including both stored clauses and proposals:
 
 ```powershell
 curl.exe http://127.0.0.1:8000/contract/1
 ```
 
-Fetch and verify one clause:
+List all proposals, or only pending proposals:
 
 ```powershell
-curl.exe http://127.0.0.1:8000/clause/1
+curl.exe http://127.0.0.1:8000/proposals
+curl.exe "http://127.0.0.1:8000/proposals?status=pending"
 ```
 
 To test tamper detection, edit a clause's `text` value directly in PostgreSQL,

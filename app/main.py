@@ -1,27 +1,121 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from math import ceil
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, status
+from fastapi.security import APIKeyHeader
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from file_integrity import sha256_text, split_into_clauses
 
 from . import models
-from .database import create_db_and_tables, get_db
-from .schemas import ClauseRead, ContractCreate, ContractRead
+from .database import SessionLocal, create_db_and_tables, get_db
+from .schemas import (
+    ClauseProposalCreate,
+    ClauseRead,
+    ContractCreate,
+    ContractRead,
+    ExpertRead,
+    ProposalRead,
+    ProposalStatus,
+    ProposalVoteRead,
+    StandaloneProposalCreate,
+    UserRead,
+    VoteCreate,
+)
+
+
+APPROVAL_THRESHOLD_PERCENT = 70
+
+PROPOSAL_PENDING = "pending"
+PROPOSAL_APPROVED = "approved"
+PROPOSAL_REJECTED = "rejected"
+
+VOTE_APPROVE = "approve"
+VOTE_REJECT = "reject"
+
+SIMULATED_EXPERTS = (
+    ("expert-alice", "lexledger-expert-alice-key"),
+    ("expert-bob", "lexledger-expert-bob-key"),
+    ("expert-carol", "lexledger-expert-carol-key"),
+)
+
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def seed_simulated_experts() -> None:
+    db = SessionLocal()
+    try:
+        for name, api_key in SIMULATED_EXPERTS:
+            existing_user = (
+                db.query(models.User)
+                .filter(models.User.api_key == api_key)
+                .one_or_none()
+            )
+            if existing_user is None:
+                db.add(models.User(name=name, api_key=api_key))
+        db.commit()
+    finally:
+        db.close()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     create_db_and_tables()
+    seed_simulated_experts()
     yield
 
 
 app = FastAPI(
     title="LexLedger Contract Storage API",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
+
+
+def active_expert_count(db: Session) -> int:
+    return (
+        db.query(models.User)
+        .filter(models.User.is_active.is_(True))
+        .count()
+    )
+
+
+def approvals_needed(eligible_voter_count: int) -> int:
+    if eligible_voter_count < 1:
+        return 1
+
+    return ceil(eligible_voter_count * APPROVAL_THRESHOLD_PERCENT / 100)
+
+
+def get_current_user(
+    api_key: str | None = Depends(api_key_header),
+    db: Session = Depends(get_db),
+) -> models.User:
+    if api_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing X-API-Key header.",
+        )
+
+    user = (
+        db.query(models.User)
+        .filter(models.User.api_key == api_key, models.User.is_active.is_(True))
+        .one_or_none()
+    )
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key.",
+        )
+
+    return user
+
+
+def build_user_response(user: models.User) -> UserRead:
+    return UserRead(id=user.id, name=user.name)
 
 
 def build_clause_response(clause: models.Clause) -> ClauseRead:
@@ -39,8 +133,49 @@ def build_clause_response(clause: models.Clause) -> ClauseRead:
     )
 
 
-def build_contract_response(contract: models.Contract) -> ContractRead:
+def build_vote_response(vote: models.Vote) -> ProposalVoteRead:
+    return ProposalVoteRead(
+        id=vote.id,
+        user_id=vote.user_id,
+        user_name=vote.user.name,
+        choice=vote.choice,
+        created_at=vote.created_at,
+        updated_at=vote.updated_at,
+    )
+
+
+def build_proposal_response(proposal: models.Proposal, db: Session) -> ProposalRead:
+    eligible_voters = active_expert_count(db)
+    approval_count = sum(1 for vote in proposal.votes if vote.choice == VOTE_APPROVE)
+    rejection_count = sum(1 for vote in proposal.votes if vote.choice == VOTE_REJECT)
+
+    return ProposalRead(
+        id=proposal.id,
+        contract_id=proposal.contract_id,
+        proposed_by=build_user_response(proposal.proposed_by),
+        position=proposal.position,
+        label=proposal.label,
+        text=proposal.text,
+        status=proposal.status,
+        stored_clause_id=proposal.stored_clause_id,
+        created_at=proposal.created_at,
+        decided_at=proposal.decided_at,
+        approval_threshold_percent=APPROVAL_THRESHOLD_PERCENT,
+        eligible_voter_count=eligible_voters,
+        approvals_needed=approvals_needed(eligible_voters),
+        vote_count=len(proposal.votes),
+        approval_count=approval_count,
+        rejection_count=rejection_count,
+        votes=[build_vote_response(vote) for vote in proposal.votes],
+    )
+
+
+def build_contract_response(contract: models.Contract, db: Session) -> ContractRead:
     clauses = [build_clause_response(clause) for clause in contract.clauses]
+    proposals = [
+        build_proposal_response(proposal, db)
+        for proposal in contract.proposals
+    ]
 
     return ContractRead(
         id=contract.id,
@@ -48,9 +183,115 @@ def build_contract_response(contract: models.Contract) -> ContractRead:
         text=contract.text,
         created_at=contract.created_at,
         clause_count=len(clauses),
-        verified=all(clause.verified for clause in clauses),
+        proposal_count=len(proposals),
+        verified=bool(clauses) and all(clause.verified for clause in clauses),
         clauses=clauses,
+        proposals=proposals,
     )
+
+
+def ensure_text_is_not_blank(text: str, detail: str) -> str:
+    cleaned_text = text.strip()
+    if not cleaned_text:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=detail,
+        )
+
+    return cleaned_text
+
+
+def next_contract_position(contract_id: int, db: Session) -> int:
+    highest_clause_position = (
+        db.query(func.max(models.Clause.position))
+        .filter(models.Clause.contract_id == contract_id)
+        .scalar()
+        or 0
+    )
+    highest_proposal_position = (
+        db.query(func.max(models.Proposal.position))
+        .filter(models.Proposal.contract_id == contract_id)
+        .scalar()
+        or 0
+    )
+
+    return max(highest_clause_position, highest_proposal_position) + 1
+
+
+def ensure_position_is_available(contract_id: int, position: int, db: Session) -> None:
+    existing_clause = (
+        db.query(models.Clause)
+        .filter(
+            models.Clause.contract_id == contract_id,
+            models.Clause.position == position,
+        )
+        .one_or_none()
+    )
+    existing_proposal = (
+        db.query(models.Proposal)
+        .filter(
+            models.Proposal.contract_id == contract_id,
+            models.Proposal.position == position,
+        )
+        .one_or_none()
+    )
+
+    if existing_clause is not None or existing_proposal is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Contract already has a clause or proposal at position {position}.",
+        )
+
+
+def tally_proposal(proposal_id: int) -> None:
+    db = SessionLocal()
+    try:
+        proposal = db.get(models.Proposal, proposal_id)
+        if proposal is None or proposal.status != PROPOSAL_PENDING:
+            return
+
+        eligible_voters = active_expert_count(db)
+        needed = approvals_needed(eligible_voters)
+        approval_count = sum(
+            1 for vote in proposal.votes if vote.choice == VOTE_APPROVE
+        )
+
+        if approval_count >= needed:
+            clause = models.Clause(
+                contract_id=proposal.contract_id,
+                position=proposal.position,
+                label=proposal.label,
+                text=proposal.text,
+                sha256_hash=sha256_text(proposal.text),
+            )
+            db.add(clause)
+            db.flush()
+
+            proposal.status = PROPOSAL_APPROVED
+            proposal.stored_clause_id = clause.id
+            proposal.decided_at = datetime.now(timezone.utc)
+        elif len(proposal.votes) >= eligible_voters:
+            proposal.status = PROPOSAL_REJECTED
+            proposal.decided_at = datetime.now(timezone.utc)
+
+        db.commit()
+    finally:
+        db.close()
+
+
+@app.get("/experts", response_model=list[ExpertRead])
+def list_experts(db: Session = Depends(get_db)) -> list[ExpertRead]:
+    users = (
+        db.query(models.User)
+        .filter(models.User.is_active.is_(True))
+        .order_by(models.User.id)
+        .all()
+    )
+
+    return [
+        ExpertRead(id=user.id, name=user.name, api_key=user.api_key)
+        for user in users
+    ]
 
 
 @app.post(
@@ -58,39 +299,42 @@ def build_contract_response(contract: models.Contract) -> ContractRead:
     response_model=ContractRead,
     status_code=status.HTTP_201_CREATED,
 )
-def create_contract(payload: ContractCreate, db: Session = Depends(get_db)) -> ContractRead:
-    if not payload.text.strip():
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Contract text cannot be blank.",
-        )
+def create_contract(
+    payload: ContractCreate,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ContractRead:
+    contract_text = ensure_text_is_not_blank(
+        payload.text,
+        "Contract text cannot be blank.",
+    )
 
-    split_clauses = split_into_clauses(payload.text)
+    split_clauses = split_into_clauses(contract_text)
     if not split_clauses:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="No clause text found in the contract.",
         )
 
-    contract = models.Contract(title=payload.title, text=payload.text)
+    contract = models.Contract(title=payload.title, text=contract_text)
     db.add(contract)
     db.flush()
 
     for position, (label, clause_text) in enumerate(split_clauses, start=1):
         db.add(
-            models.Clause(
+            models.Proposal(
                 contract_id=contract.id,
+                proposed_by_id=current_user.id,
                 position=position,
                 label=label,
                 text=clause_text,
-                sha256_hash=sha256_text(clause_text),
             )
         )
 
     db.commit()
     db.refresh(contract)
 
-    return build_contract_response(contract)
+    return build_contract_response(contract, db)
 
 
 @app.get("/contract/{contract_id}", response_model=ContractRead)
@@ -102,7 +346,153 @@ def get_contract(contract_id: int, db: Session = Depends(get_db)) -> ContractRea
             detail="Contract not found.",
         )
 
-    return build_contract_response(contract)
+    return build_contract_response(contract, db)
+
+
+@app.post(
+    "/proposal",
+    response_model=ProposalRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def propose_standalone_clause(
+    payload: StandaloneProposalCreate,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ProposalRead:
+    clause_text = ensure_text_is_not_blank(
+        payload.text,
+        "Clause text cannot be blank.",
+    )
+
+    contract = models.Contract(title=payload.title, text=clause_text)
+    db.add(contract)
+    db.flush()
+
+    proposal = models.Proposal(
+        contract_id=contract.id,
+        proposed_by_id=current_user.id,
+        position=1,
+        label=payload.label,
+        text=clause_text,
+    )
+    db.add(proposal)
+    db.commit()
+    db.refresh(proposal)
+
+    return build_proposal_response(proposal, db)
+
+
+@app.post(
+    "/contract/{contract_id}/proposal",
+    response_model=ProposalRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def propose_contract_clause(
+    contract_id: int,
+    payload: ClauseProposalCreate,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ProposalRead:
+    contract = db.get(models.Contract, contract_id)
+    if contract is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Contract not found.",
+        )
+
+    clause_text = ensure_text_is_not_blank(
+        payload.text,
+        "Clause text cannot be blank.",
+    )
+    position = payload.position or next_contract_position(contract_id, db)
+    ensure_position_is_available(contract_id, position, db)
+
+    proposal = models.Proposal(
+        contract_id=contract.id,
+        proposed_by_id=current_user.id,
+        position=position,
+        label=payload.label or f"clause_{position}",
+        text=clause_text,
+    )
+    db.add(proposal)
+    db.commit()
+    db.refresh(proposal)
+
+    return build_proposal_response(proposal, db)
+
+
+@app.get("/proposals", response_model=list[ProposalRead])
+def list_proposals(
+    proposal_status: ProposalStatus | None = Query(default=None, alias="status"),
+    db: Session = Depends(get_db),
+) -> list[ProposalRead]:
+    query = db.query(models.Proposal).order_by(models.Proposal.created_at.desc())
+    if proposal_status is not None:
+        query = query.filter(models.Proposal.status == proposal_status)
+
+    return [
+        build_proposal_response(proposal, db)
+        for proposal in query.all()
+    ]
+
+
+@app.get("/proposal/{proposal_id}", response_model=ProposalRead)
+def get_proposal(proposal_id: int, db: Session = Depends(get_db)) -> ProposalRead:
+    proposal = db.get(models.Proposal, proposal_id)
+    if proposal is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Proposal not found.",
+        )
+
+    return build_proposal_response(proposal, db)
+
+
+@app.post("/proposal/{proposal_id}/vote", response_model=ProposalRead)
+def vote_on_proposal(
+    proposal_id: int,
+    payload: VoteCreate,
+    background_tasks: BackgroundTasks,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ProposalRead:
+    proposal = db.get(models.Proposal, proposal_id)
+    if proposal is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Proposal not found.",
+        )
+    if proposal.status != PROPOSAL_PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Proposal is already {proposal.status}.",
+        )
+
+    existing_vote = (
+        db.query(models.Vote)
+        .filter(
+            models.Vote.proposal_id == proposal_id,
+            models.Vote.user_id == current_user.id,
+        )
+        .one_or_none()
+    )
+    if existing_vote is None:
+        db.add(
+            models.Vote(
+                proposal_id=proposal_id,
+                user_id=current_user.id,
+                choice=payload.choice,
+            )
+        )
+    else:
+        existing_vote.choice = payload.choice
+        existing_vote.updated_at = datetime.now(timezone.utc)
+
+    db.commit()
+    db.refresh(proposal)
+    background_tasks.add_task(tally_proposal, proposal.id)
+
+    return build_proposal_response(proposal, db)
 
 
 @app.get("/clause/{clause_id}", response_model=ClauseRead)
