@@ -11,12 +11,26 @@ from sqlalchemy.orm import Session
 from file_integrity import sha256_text, split_into_clauses
 
 from . import models
+from .crypto import (
+    add_ciphertexts,
+    build_signed_encrypted_vote_payload,
+    ciphertext_from_decimal_strings,
+    ciphertext_to_document,
+    decrypt_total,
+    election_public_key,
+    public_key_document,
+    signature_digest,
+    signing_public_key_for_api_key,
+    verify_vote_signature,
+)
 from .database import SessionLocal, create_db_and_tables, get_db
 from .schemas import (
     ClauseProposalCreate,
     ClauseRead,
     ContractCreate,
     ContractRead,
+    ElectionPublicKeyRead,
+    EncryptedVoteRead,
     ExpertRead,
     ProposalRead,
     ProposalStatus,
@@ -24,6 +38,7 @@ from .schemas import (
     StandaloneProposalCreate,
     UserRead,
     VoteCreate,
+    VoteDraftCreate,
 )
 
 
@@ -32,9 +47,6 @@ APPROVAL_THRESHOLD_PERCENT = 70
 PROPOSAL_PENDING = "pending"
 PROPOSAL_APPROVED = "approved"
 PROPOSAL_REJECTED = "rejected"
-
-VOTE_APPROVE = "approve"
-VOTE_REJECT = "reject"
 
 SIMULATED_EXPERTS = (
     ("expert-alice", "lexledger-expert-alice-key"),
@@ -49,13 +61,22 @@ def seed_simulated_experts() -> None:
     db = SessionLocal()
     try:
         for name, api_key in SIMULATED_EXPERTS:
+            signing_public_key = signing_public_key_for_api_key(api_key)
             existing_user = (
                 db.query(models.User)
                 .filter(models.User.api_key == api_key)
                 .one_or_none()
             )
             if existing_user is None:
-                db.add(models.User(name=name, api_key=api_key))
+                db.add(
+                    models.User(
+                        name=name,
+                        api_key=api_key,
+                        signing_public_key=signing_public_key,
+                    )
+                )
+            elif existing_user.signing_public_key != signing_public_key:
+                existing_user.signing_public_key = signing_public_key
         db.commit()
     finally:
         db.close()
@@ -114,6 +135,15 @@ def get_current_user(
     return user
 
 
+def ensure_user_signing_public_key(user: models.User, db: Session) -> str:
+    if user.signing_public_key is None:
+        user.signing_public_key = signing_public_key_for_api_key(user.api_key)
+        db.commit()
+        db.refresh(user)
+
+    return user.signing_public_key
+
+
 def build_user_response(user: models.User) -> UserRead:
     return UserRead(id=user.id, name=user.name)
 
@@ -138,16 +168,46 @@ def build_vote_response(vote: models.Vote) -> ProposalVoteRead:
         id=vote.id,
         user_id=vote.user_id,
         user_name=vote.user.name,
-        choice=vote.choice,
+        ciphertext=EncryptedVoteRead(
+            c1=vote.ciphertext_c1,
+            c2=vote.ciphertext_c2,
+        ),
+        signature=vote.signature,
+        signature_public_key=vote.signature_public_key,
+        signature_digest=vote.signature_digest,
         created_at=vote.created_at,
         updated_at=vote.updated_at,
     )
 
 
+def encrypted_votes(proposal: models.Proposal) -> list[models.Vote]:
+    return [
+        vote
+        for vote in proposal.votes
+        if vote.ciphertext_c1 is not None and vote.ciphertext_c2 is not None
+    ]
+
+
+def encrypted_vote_tally(
+    votes: list[models.Vote],
+) -> tuple[int, EncryptedVoteRead | None]:
+    if not votes:
+        return 0, None
+
+    ciphertexts = [
+        ciphertext_from_decimal_strings(vote.ciphertext_c1, vote.ciphertext_c2)
+        for vote in votes
+    ]
+    encrypted_tally = add_ciphertexts(ciphertexts, election_public_key())
+    approval_count = decrypt_total(encrypted_tally, max_total=len(ciphertexts))
+    return approval_count, EncryptedVoteRead(**ciphertext_to_document(encrypted_tally))
+
+
 def build_proposal_response(proposal: models.Proposal, db: Session) -> ProposalRead:
     eligible_voters = active_expert_count(db)
-    approval_count = sum(1 for vote in proposal.votes if vote.choice == VOTE_APPROVE)
-    rejection_count = sum(1 for vote in proposal.votes if vote.choice == VOTE_REJECT)
+    votes = encrypted_votes(proposal)
+    approval_count, encrypted_approval_tally = encrypted_vote_tally(votes)
+    rejection_count = len(votes) - approval_count
 
     return ProposalRead(
         id=proposal.id,
@@ -163,10 +223,11 @@ def build_proposal_response(proposal: models.Proposal, db: Session) -> ProposalR
         approval_threshold_percent=APPROVAL_THRESHOLD_PERCENT,
         eligible_voter_count=eligible_voters,
         approvals_needed=approvals_needed(eligible_voters),
-        vote_count=len(proposal.votes),
+        vote_count=len(votes),
         approval_count=approval_count,
         rejection_count=rejection_count,
-        votes=[build_vote_response(vote) for vote in proposal.votes],
+        encrypted_approval_tally=encrypted_approval_tally,
+        votes=[build_vote_response(vote) for vote in votes],
     )
 
 
@@ -252,9 +313,8 @@ def tally_proposal(proposal_id: int) -> None:
 
         eligible_voters = active_expert_count(db)
         needed = approvals_needed(eligible_voters)
-        approval_count = sum(
-            1 for vote in proposal.votes if vote.choice == VOTE_APPROVE
-        )
+        votes = encrypted_votes(proposal)
+        approval_count, _ = encrypted_vote_tally(votes)
 
         if approval_count >= needed:
             clause = models.Clause(
@@ -270,7 +330,7 @@ def tally_proposal(proposal_id: int) -> None:
             proposal.status = PROPOSAL_APPROVED
             proposal.stored_clause_id = clause.id
             proposal.decided_at = datetime.now(timezone.utc)
-        elif len(proposal.votes) >= eligible_voters:
+        elif len(votes) >= eligible_voters:
             proposal.status = PROPOSAL_REJECTED
             proposal.decided_at = datetime.now(timezone.utc)
 
@@ -289,9 +349,19 @@ def list_experts(db: Session = Depends(get_db)) -> list[ExpertRead]:
     )
 
     return [
-        ExpertRead(id=user.id, name=user.name, api_key=user.api_key)
+        ExpertRead(
+            id=user.id,
+            name=user.name,
+            api_key=user.api_key,
+            signing_public_key=user.signing_public_key,
+        )
         for user in users
     ]
+
+
+@app.get("/crypto/public-key", response_model=ElectionPublicKeyRead)
+def get_crypto_public_key() -> ElectionPublicKeyRead:
+    return ElectionPublicKeyRead(**public_key_document())
 
 
 @app.post(
@@ -448,6 +518,36 @@ def get_proposal(proposal_id: int, db: Session = Depends(get_db)) -> ProposalRea
     return build_proposal_response(proposal, db)
 
 
+@app.post("/proposal/{proposal_id}/vote/draft", response_model=VoteCreate)
+def draft_encrypted_vote(
+    proposal_id: int,
+    payload: VoteDraftCreate,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> VoteCreate:
+    proposal = db.get(models.Proposal, proposal_id)
+    if proposal is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Proposal not found.",
+        )
+    if proposal.status != PROPOSAL_PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Proposal is already {proposal.status}.",
+        )
+
+    ensure_user_signing_public_key(current_user, db)
+    return VoteCreate(
+        **build_signed_encrypted_vote_payload(
+            proposal_id=proposal_id,
+            user_id=current_user.id,
+            choice=payload.choice,
+            api_key=current_user.api_key,
+        )
+    )
+
+
 @app.post("/proposal/{proposal_id}/vote", response_model=ProposalRead)
 def vote_on_proposal(
     proposal_id: int,
@@ -468,6 +568,45 @@ def vote_on_proposal(
             detail=f"Proposal is already {proposal.status}.",
         )
 
+    try:
+        ciphertext = ciphertext_from_decimal_strings(
+            payload.ciphertext.c1,
+            payload.ciphertext.c2,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+    signing_public_key = ensure_user_signing_public_key(current_user, db)
+    if not verify_vote_signature(
+        proposal_id=proposal_id,
+        user_id=current_user.id,
+        ciphertext=ciphertext,
+        signature=payload.signature,
+        public_key_text=signing_public_key,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Vote signature does not match the authenticated expert and ciphertext.",
+        )
+
+    signed_vote_digest = signature_digest(payload.signature)
+    existing_signature = (
+        db.query(models.Vote)
+        .filter(
+            models.Vote.proposal_id == proposal_id,
+            models.Vote.signature_digest == signed_vote_digest,
+        )
+        .one_or_none()
+    )
+    if existing_signature is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Duplicate signed vote payload.",
+        )
+
     existing_vote = (
         db.query(models.Vote)
         .filter(
@@ -476,17 +615,23 @@ def vote_on_proposal(
         )
         .one_or_none()
     )
-    if existing_vote is None:
-        db.add(
-            models.Vote(
-                proposal_id=proposal_id,
-                user_id=current_user.id,
-                choice=payload.choice,
-            )
+    if existing_vote is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Expert has already submitted a vote for this proposal.",
         )
-    else:
-        existing_vote.choice = payload.choice
-        existing_vote.updated_at = datetime.now(timezone.utc)
+
+    db.add(
+        models.Vote(
+            proposal_id=proposal_id,
+            user_id=current_user.id,
+            ciphertext_c1=str(ciphertext.c1),
+            ciphertext_c2=str(ciphertext.c2),
+            signature=payload.signature,
+            signature_public_key=signing_public_key,
+            signature_digest=signed_vote_digest,
+        )
+    )
 
     db.commit()
     db.refresh(proposal)

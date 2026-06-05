@@ -65,6 +65,11 @@ class User(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
     api_key: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    signing_public_key: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+        unique=True,
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -122,7 +127,10 @@ class Proposal(Base):
 
 class Vote(Base):
     __tablename__ = "votes"
-    __table_args__ = (UniqueConstraint("proposal_id", "user_id"),)
+    __table_args__ = (
+        UniqueConstraint("proposal_id", "user_id"),
+        UniqueConstraint("proposal_id", "signature_digest"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     proposal_id: Mapped[int] = mapped_column(
@@ -135,7 +143,11 @@ class Vote(Base):
         nullable=False,
         index=True,
     )
-    choice: Mapped[str] = mapped_column(String(20), nullable=False)
+    ciphertext_c1: Mapped[str] = mapped_column(Text, nullable=False)
+    ciphertext_c2: Mapped[str] = mapped_column(Text, nullable=False)
+    signature: Mapped[str] = mapped_column(Text, nullable=False)
+    signature_public_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    signature_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

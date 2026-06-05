@@ -25,7 +25,17 @@ class ClauseProposalCreate(BaseModel):
     text: str = Field(..., min_length=1)
 
 
+class EncryptedVoteRead(BaseModel):
+    c1: str
+    c2: str
+
+
 class VoteCreate(BaseModel):
+    ciphertext: EncryptedVoteRead
+    signature: str = Field(..., min_length=1)
+
+
+class VoteDraftCreate(BaseModel):
     choice: VoteChoice
 
 
@@ -36,6 +46,14 @@ class UserRead(BaseModel):
 
 class ExpertRead(UserRead):
     api_key: str
+    signing_public_key: str | None
+
+
+class ElectionPublicKeyRead(BaseModel):
+    algorithm: str
+    p: str
+    g: str
+    y: str
 
 
 class ClauseRead(BaseModel):
@@ -53,7 +71,10 @@ class ProposalVoteRead(BaseModel):
     id: int
     user_id: int
     user_name: str
-    choice: VoteChoice
+    ciphertext: EncryptedVoteRead
+    signature: str
+    signature_public_key: str
+    signature_digest: str
     created_at: datetime
     updated_at: datetime | None
 
@@ -75,6 +96,7 @@ class ProposalRead(BaseModel):
     vote_count: int
     approval_count: int
     rejection_count: int
+    encrypted_approval_tally: EncryptedVoteRead | None
     votes: list[ProposalVoteRead]
 
 
