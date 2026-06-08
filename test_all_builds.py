@@ -274,11 +274,19 @@ def test_build_3_4_5():
         assert prop2_after["stored_clause_id"] is None
         print(f"[OK] Rejection logic verified: Proposal status={prop2_after['status']}, Clause stored={prop2_after['stored_clause_id']}")
 
+def test_build_6():
+    print("\n--- Verifying Build 6: Simple Blockchain from Scratch ---")
+    result = run_cmd(["run_blockchain_demo.py"])
+    assert result.returncode == 0, f"Blockchain demo execution failed: {result.stderr}"
+    print(result.stdout)
+    print("[OK] Blockchain verification successfully passed all assertions.")
+
 if __name__ == "__main__":
     try:
         test_build_1()
         test_build_2()
         test_build_3_4_5()
+        test_build_6()
         print("\n=================================")
         print("ALL BUILDS VERIFIED SUCCESSFULLY!")
         print("=================================")
