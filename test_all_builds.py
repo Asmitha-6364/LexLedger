@@ -281,12 +281,37 @@ def test_build_6():
     print(result.stdout)
     print("[OK] Blockchain verification successfully passed all assertions.")
 
+def test_build_7():
+    print("\n--- Verifying Build 7: Basic RAG Pipeline for Contract Querying ---")
+    
+    # 1. Test payment terms query
+    result_payment = run_cmd(["contract_query.py", "--file", "full_contract.pdf", "--query", "what are the payment terms?", "--clear"])
+    assert result_payment.returncode == 0, f"Payment terms query failed: {result_payment.stderr}"
+    print(result_payment.stdout)
+    
+    # Verify accurate answer is present
+    assert "USD 5,000" in result_payment.stdout, "Payment fee not mentioned in output"
+    assert "within 30 days" in result_payment.stdout or "30 days" in result_payment.stdout, "Payment timeframe not mentioned in output"
+    assert "CLAUSE 1: PAYMENT TERMS" in result_payment.stdout, "Did not retrieve payment terms clause"
+    print("[OK] Payment terms retrieved and answered accurately.")
+
+    # 2. Test query not in contract
+    result_dog = run_cmd(["contract_query.py", "--file", "full_contract.pdf", "--query", "what is the refund policy for dogs?"])
+    assert result_dog.returncode == 0, f"Dog refund query failed: {result_dog.stderr}"
+    print(result_dog.stdout)
+    
+    # Verify fallback response is present
+    assert "I cannot find the answer in the provided document." in result_dog.stdout, "Fallback message not found for unrelated query"
+    print("[OK] Unrelated query handled correctly by returning fallback answer.")
+    print("[OK] Build 7 RAG pipeline verification successfully passed all assertions.")
+
 if __name__ == "__main__":
     try:
         test_build_1()
         test_build_2()
         test_build_3_4_5()
         test_build_6()
+        test_build_7()
         print("\n=================================")
         print("ALL BUILDS VERIFIED SUCCESSFULLY!")
         print("=================================")

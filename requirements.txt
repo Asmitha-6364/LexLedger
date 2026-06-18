@@ -3,3 +3,9 @@ uvicorn[standard]
 SQLAlchemy
 psycopg[binary]
 cryptography
+langchain
+langchain-openai
+langchain-chroma
+langchain-community
+chromadb
+pypdf
