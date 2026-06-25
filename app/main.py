@@ -39,7 +39,12 @@ from .schemas import (
     UserRead,
     VoteCreate,
     VoteDraftCreate,
+    ContractQueryRequest,
+    ContractQueryResponse,
 )
+from fastapi.responses import JSONResponse
+from .rag import VerificationFailedException, run_contract_query
+
 
 
 APPROVAL_THRESHOLD_PERCENT = 70
@@ -94,6 +99,14 @@ app = FastAPI(
     version="0.2.0",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(VerificationFailedException)
+def verification_failed_exception_handler(request, exc: VerificationFailedException):
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={"detail": f"Verification failed: {exc.message}"},
+    )
 
 
 def active_expert_count(db: Session) -> int:
@@ -650,3 +663,37 @@ def get_clause(clause_id: int, db: Session = Depends(get_db)) -> ClauseRead:
         )
 
     return build_clause_response(clause)
+
+
+@app.post("/contract/{contract_id}/query", response_model=ContractQueryResponse)
+def query_contract(
+    contract_id: int,
+    payload: ContractQueryRequest,
+    db: Session = Depends(get_db),
+) -> ContractQueryResponse:
+    contract = db.get(models.Contract, contract_id)
+    if contract is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Contract not found.",
+        )
+
+    try:
+        response_text, retrieved_clauses_db, verified = run_contract_query(
+            contract_id=contract_id,
+            query=payload.query,
+            db=db,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        )
+
+    return ContractQueryResponse(
+        query=payload.query,
+        response=response_text,
+        verified=verified,
+        retrieved_clauses=[build_clause_response(clause) for clause in retrieved_clauses_db],
+    )
+

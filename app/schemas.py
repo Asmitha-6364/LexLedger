@@ -110,3 +110,15 @@ class ContractRead(BaseModel):
     verified: bool
     clauses: list[ClauseRead]
     proposals: list[ProposalRead]
+
+
+class ContractQueryRequest(BaseModel):
+    query: str
+
+
+class ContractQueryResponse(BaseModel):
+    query: str
+    response: str
+    verified: bool
+    retrieved_clauses: list[ClauseRead]
+

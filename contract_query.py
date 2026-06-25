@@ -10,11 +10,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
 from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+from file_integrity import split_into_clauses, sha256_text
 
 # Try importing OpenAI, fail gracefully if keys aren't set
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -136,34 +137,94 @@ def main():
         action="store_true",
         help="Clear the existing persist-dir before indexing."
     )
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=Path("manifest.json"),
+        help="Path to the manifest JSON file. Default is manifest.json"
+    )
+    parser.add_argument(
+        "--contract-id",
+        type=int,
+        help="Query a contract from the database by its ID."
+    )
 
     args = parser.parse_args()
 
-    if not args.file.exists():
-        print(f"ERROR: Contract file not found: {args.file}")
-        sys.exit(1)
+    # 1. Load splits
+    splits = []
+    use_db = False
+    manifest = {}
 
-    # 1. Load the document
-    print(f"[{args.file.name}] Loading document...")
-    if args.file.suffix.lower() == ".pdf":
-        loader = PyPDFLoader(str(args.file))
+    if args.contract_id is not None:
+        use_db = True
+        from app.database import SessionLocal
+        from app import models
+        db = SessionLocal()
+        try:
+            clauses = db.query(models.Clause).filter(models.Clause.contract_id == args.contract_id).all()
+            if not clauses:
+                print(f"ERROR: No approved clauses found in DB for contract ID {args.contract_id}")
+                sys.exit(1)
+            for clause in clauses:
+                splits.append(Document(
+                    page_content=clause.text,
+                    metadata={
+                        "clause_id": clause.id,
+                        "label": clause.label,
+                        "stored_hash": clause.sha256_hash,
+                    }
+                ))
+            print(f"[DB] Loaded {len(splits)} clauses for contract ID {args.contract_id} from database.")
+        except Exception as exc:
+            print(f"ERROR: Database error: {exc}")
+            sys.exit(1)
+        finally:
+            db.close()
     else:
-        loader = TextLoader(str(args.file), encoding="utf-8")
+        if not args.file.exists():
+            print(f"ERROR: Contract file not found: {args.file}")
+            sys.exit(1)
+
+        # Load the document
+        print(f"[{args.file.name}] Loading document...")
+        if args.file.suffix.lower() == ".pdf":
+            loader = PyPDFLoader(str(args.file))
+        else:
+            loader = TextLoader(str(args.file), encoding="utf-8")
+            
+        try:
+            docs = loader.load()
+        except Exception as exc:
+            print(f"ERROR: Failed to load document: {exc}")
+            sys.exit(1)
+
+        # Split the contract into clauses/chunks
+        print(f"[{args.file.name}] Splitting document...")
+        contract_text = "\n\n".join(doc.page_content for doc in docs)
+        clauses = split_into_clauses(contract_text)
         
-    try:
-        docs = loader.load()
-    except Exception as exc:
-        print(f"ERROR: Failed to load document: {exc}")
-        sys.exit(1)
+        for clause_id, clause_text in clauses:
+            splits.append(Document(
+                page_content=clause_text,
+                metadata={
+                    "label": clause_id,
+                    "source": str(args.file),
+                }
+            ))
+        print(f"[{args.file.name}] Split into {len(splits)} chunks.")
 
-    # 2. Split the contract into clauses/chunks
-    print(f"[{args.file.name}] Splitting document...")
-    # Use chunk size 500 characters and 50 characters overlap as a basic text splitter
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    splits = text_splitter.split_documents(docs)
-    print(f"[{args.file.name}] Split into {len(splits)} chunks.")
+        # Load manifest if available
+        if args.manifest and args.manifest.exists():
+            import json
+            try:
+                with open(args.manifest, "r", encoding="utf-8") as f:
+                    manifest = json.load(f)
+                print(f"[Manifest] Loaded manifest with {len(manifest)} clause hashes from {args.manifest}.")
+            except Exception as exc:
+                print(f"WARNING: Failed to load manifest: {exc}")
 
-    # 3. Setup embeddings
+    # 2. Setup embeddings
     if OPENAI_API_KEY:
         from langchain_openai import OpenAIEmbeddings
         embeddings = OpenAIEmbeddings()
@@ -172,27 +233,72 @@ def main():
         embeddings = SimpleKeywordEmbeddings()
         print("[Embeddings] OPENAI_API_KEY not set. Using SimpleKeywordEmbeddings (Mock).")
 
-    # 4. Clear existing db if requested
+    # 3. Clear existing db if requested
     if args.clear and args.persist_dir.exists():
         print(f"[VectorStore] Clearing existing directory: {args.persist_dir}")
         shutil.rmtree(args.persist_dir)
 
-    # 5. Store/Retrieve in Chroma Vector DB
+    # 4. Store/Retrieve in Chroma Vector DB
     print(f"[VectorStore] Initializing Chroma at: {args.persist_dir}")
-    # Chroma needs to be populated with splits
     vectorstore = Chroma.from_documents(
         documents=splits,
         embedding=embeddings,
         persist_directory=str(args.persist_dir)
     )
     
-    # 6. Setup retriever
+    # 5. Setup retriever
     # Search top 3 most similar document chunks
     retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+
+    # Verification middleware
+    def verify_documents(docs_list):
+        for doc in docs_list:
+            label = doc.metadata.get("label")
+            text_hash = sha256_text(doc.page_content)
+            
+            if use_db:
+                clause_id = doc.metadata.get("clause_id")
+                from app.database import SessionLocal
+                from app import models
+                db = SessionLocal()
+                try:
+                    db_clause = db.get(models.Clause, clause_id)
+                    if not db_clause:
+                        print(f"VERIFICATION FAILURE: Clause {label} (ID {clause_id}) not found in database.", file=sys.stderr)
+                        sys.exit(2)
+                    
+                    # Verify DB text integrity
+                    current_db_hash = sha256_text(db_clause.text)
+                    if current_db_hash != db_clause.sha256_hash:
+                        print(f"VERIFICATION FAILURE: Clause '{label}' has been tampered with in the database!", file=sys.stderr)
+                        sys.exit(2)
+                        
+                    # Verify retrieved document against DB hash
+                    if text_hash != db_clause.sha256_hash:
+                        print(f"VERIFICATION FAILURE: Retrieved chunk for clause '{label}' does not match database stored hash!", file=sys.stderr)
+                        sys.exit(2)
+                finally:
+                    db.close()
+            else:
+                if manifest:
+                    if label not in manifest:
+                        print(f"VERIFICATION FAILURE: Clause '{label}' not found in manifest.", file=sys.stderr)
+                        sys.exit(2)
+                    stored_hash = manifest[label]
+                    if text_hash != stored_hash:
+                        print(f"VERIFICATION FAILURE: Clause '{label}' has been tampered with! (Retrieved: {text_hash}, Stored: {stored_hash})", file=sys.stderr)
+                        sys.exit(2)
+                else:
+                    print(f"[Warning] No verification manifest or DB for clause '{label}'. Skipping check.")
+        return docs_list
 
     # Retrieve matching chunks to demonstrate retrieval specifically
     print(f"[Query] Querying retriever: '{args.query}'")
     retrieved_docs = retriever.invoke(args.query)
+    
+    # Run retrieval verification manually to display intermediate alerts/status
+    verify_documents(retrieved_docs)
+    
     print("\n--- RETRIEVED CLAUSES/CHUNKS ---")
     for idx, doc in enumerate(retrieved_docs, start=1):
         source_info = f" (Page {doc.metadata.get('page', 0) + 1})" if "page" in doc.metadata else ""
@@ -200,7 +306,7 @@ def main():
         print(doc.page_content.strip())
     print("--------------------------------\n")
 
-    # 7. Setup LLM
+    # 6. Setup LLM
     if OPENAI_API_KEY:
         from langchain_openai import ChatOpenAI
         llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
@@ -209,7 +315,7 @@ def main():
         llm = MockContractLLM()
         print("[LLM] OPENAI_API_KEY not set. Using MockContractLLM.")
 
-    # 8. Setup RAG prompt template and chain
+    # 7. Setup RAG prompt template and chain
     prompt_template = """You are a contract analysis assistant. Answer the user's question based strictly on the provided contract context.
 If the answer cannot be found in the provided context, state clearly: "I cannot find the answer in the provided document."
 Do not try to make up an answer or use external knowledge.
@@ -225,9 +331,9 @@ Answer:"""
     def format_docs(docs_list):
         return "\n\n".join(doc.page_content for doc in docs_list)
 
-    # LCEL pipeline
+    # LCEL pipeline with verification middleware
     rag_chain = (
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        {"context": retriever | verify_documents | format_docs, "question": RunnablePassthrough()}
         | prompt
         | llm
         | StrOutputParser()
