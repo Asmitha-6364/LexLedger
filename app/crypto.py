@@ -37,6 +37,7 @@ ELGAMAL_PRIME = int(
 )
 ELGAMAL_GENERATOR = 2
 DEFAULT_ELECTION_SECRET = "lexledger-build-5-demo-election-key"
+DEFAULT_RESPONSE_SIGNING_SECRET = "lexledger-build-10-demo-response-signing-key"
 
 
 @dataclass(frozen=True)
@@ -163,6 +164,13 @@ def ciphertext_from_decimal_strings(c1: str, c2: str) -> ElGamalCiphertext:
     return ElGamalCiphertext(c1=parsed_c1, c2=parsed_c2)
 
 
+def validate_binary_vote_ciphertext(ciphertext: ElGamalCiphertext) -> int:
+    try:
+        return decrypt_total(ciphertext, max_total=1)
+    except ValueError as exc:
+        raise ValueError("Encrypted vote must decrypt to a binary 0/1 choice.") from exc
+
+
 def ciphertext_to_document(ciphertext: ElGamalCiphertext) -> dict[str, str]:
     return {"c1": str(ciphertext.c1), "c2": str(ciphertext.c2)}
 
@@ -182,6 +190,31 @@ def signing_public_key_to_text(public_key: Ed25519PublicKey) -> str:
         format=serialization.PublicFormat.Raw,
     )
     return base64.b64encode(public_bytes).decode("ascii")
+
+
+@lru_cache
+def response_signing_private_key() -> Ed25519PrivateKey:
+    secret = os.getenv(
+        "LEXLEDGER_RESPONSE_SIGNING_SECRET",
+        DEFAULT_RESPONSE_SIGNING_SECRET,
+    )
+    seed = hashlib.sha256(f"lexledger-response-signing-key:{secret}".encode("utf-8")).digest()
+    return Ed25519PrivateKey.from_private_bytes(seed)
+
+
+def response_signing_public_key_text() -> str:
+    return signing_public_key_to_text(response_signing_private_key().public_key())
+
+
+def _canonical_response_signature_message(payload: dict[str, object]) -> bytes:
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def sign_response_payload(payload: dict[str, object]) -> str:
+    signature = response_signing_private_key().sign(
+        _canonical_response_signature_message(payload)
+    )
+    return base64.b64encode(signature).decode("ascii")
 
 
 def _signature_message(

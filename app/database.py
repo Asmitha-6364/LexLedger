@@ -1,14 +1,39 @@
 import os
+import logging
 from collections.abc import Generator
+from urllib.parse import quote_plus
 
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+psycopg://lexledger:lexledger@localhost:5432/lexledger",
-)
+logger = logging.getLogger("lexledger.database")
+
+
+def build_database_url() -> str:
+    direct_url = os.getenv("DATABASE_URL")
+    if direct_url:
+        return direct_url
+
+    user = os.getenv("POSTGRES_USER", "lexledger")
+    password = os.getenv("POSTGRES_PASSWORD")
+    host = os.getenv("POSTGRES_HOST", "localhost")
+    port = os.getenv("POSTGRES_PORT", "5432")
+    database = os.getenv("POSTGRES_DB", "lexledger")
+
+    if password is None:
+        password = "lexledger"
+        logger.warning(
+            "POSTGRES_PASSWORD is not set; using insecure local-development database credentials."
+        )
+
+    return (
+        "postgresql+psycopg://"
+        f"{quote_plus(user)}:{quote_plus(password)}@{host}:{port}/{quote_plus(database)}"
+    )
+
+
+DATABASE_URL = build_database_url()
 
 
 class Base(DeclarativeBase):
@@ -20,7 +45,34 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
 def create_db_and_tables() -> None:
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as connection:
+            connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+
     Base.metadata.create_all(bind=engine)
+
+    # Database-agnostic table creation for clause_embeddings
+    with engine.begin() as connection:
+        inspector = inspect(connection)
+        table_names = set(inspector.get_table_names())
+        if "clause_embeddings" not in table_names:
+            if connection.dialect.name == "postgresql":
+                connection.execute(text("""
+                    CREATE TABLE clause_embeddings (
+                        id SERIAL PRIMARY KEY,
+                        clause_id INTEGER NOT NULL REFERENCES clauses(id) ON DELETE CASCADE,
+                        embedding VECTOR(1536) NOT NULL
+                    )
+                """))
+            else:
+                connection.execute(text("""
+                    CREATE TABLE clause_embeddings (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        clause_id INTEGER NOT NULL REFERENCES clauses(id) ON DELETE CASCADE,
+                        embedding TEXT NOT NULL
+                    )
+                """))
+
     run_lightweight_migrations()
 
 
@@ -34,6 +86,10 @@ def run_lightweight_migrations() -> None:
             if "signing_public_key" not in user_columns:
                 connection.execute(
                     text("ALTER TABLE users ADD COLUMN signing_public_key VARCHAR(128)")
+                )
+            if "organization_id" not in user_columns:
+                connection.execute(
+                    text("ALTER TABLE users ADD COLUMN organization_id INTEGER REFERENCES organizations(id) ON DELETE SET NULL")
                 )
 
         if "votes" not in table_names:

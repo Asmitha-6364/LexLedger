@@ -9,3 +9,6 @@ langchain-chroma
 langchain-community
 chromadb
 pypdf
+python-dotenv
+redis
+pika

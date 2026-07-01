@@ -59,6 +59,15 @@ class Clause(Base):
     contract: Mapped[Contract] = relationship(back_populates="clauses")
 
 
+class Organization(Base):
+    __tablename__ = "organizations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+
+    users: Mapped[list[User]] = relationship(back_populates="organization")
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -76,6 +85,13 @@ class User(Base):
         server_default=func.now(),
         nullable=False,
     )
+
+    organization_id: Mapped[int | None] = mapped_column(
+        ForeignKey("organizations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    organization: Mapped[Organization | None] = relationship(back_populates="users")
 
     proposals: Mapped[list[Proposal]] = relationship(back_populates="proposed_by")
     votes: Mapped[list[Vote]] = relationship(back_populates="user")

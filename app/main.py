@@ -2,9 +2,14 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from math import ceil
+import os
+import secrets
+import time
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.security import APIKeyHeader
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -19,8 +24,11 @@ from .crypto import (
     decrypt_total,
     election_public_key,
     public_key_document,
+    response_signing_public_key_text,
+    sign_response_payload,
     signature_digest,
     signing_public_key_for_api_key,
+    validate_binary_vote_ciphertext,
     verify_vote_signature,
 )
 from .database import SessionLocal, create_db_and_tables, get_db
@@ -30,6 +38,7 @@ from .schemas import (
     ContractCreate,
     ContractRead,
     ElectionPublicKeyRead,
+    ExpertCreatedRead,
     EncryptedVoteRead,
     ExpertRead,
     ProposalRead,
@@ -41,13 +50,16 @@ from .schemas import (
     VoteDraftCreate,
     ContractQueryRequest,
     ContractQueryResponse,
+    OrganizationCreate,
+    OrganizationRead,
 )
-from fastapi.responses import JSONResponse
-from .rag import VerificationFailedException, run_contract_query
+from .rag import AuditLogFailedException, VerificationFailedException, run_contract_query
 
 
 
 APPROVAL_THRESHOLD_PERCENT = 70
+RATE_LIMIT_PER_MINUTE = int(os.getenv("LEXLEDGER_RATE_LIMIT_PER_MINUTE", "300"))
+RATE_LIMIT_WINDOW_SECONDS = 60
 
 PROPOSAL_PENDING = "pending"
 PROPOSAL_APPROVED = "approved"
@@ -60,6 +72,7 @@ SIMULATED_EXPERTS = (
 )
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+rate_limit_windows: dict[str, tuple[int, int]] = {}
 
 
 def seed_simulated_experts() -> None:
@@ -91,6 +104,14 @@ def seed_simulated_experts() -> None:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     create_db_and_tables()
     seed_simulated_experts()
+
+    # Start RabbitMQ consumer if online
+    from .queue_manager import is_rabbitmq_online, start_rabbitmq_consumer
+    import threading
+    if is_rabbitmq_online():
+        t = threading.Thread(target=start_rabbitmq_consumer, daemon=True)
+        t.start()
+
     yield
 
 
@@ -101,11 +122,46 @@ app = FastAPI(
 )
 
 
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    if RATE_LIMIT_PER_MINUTE <= 0:
+        return await call_next(request)
+
+    api_key = request.headers.get("x-api-key")
+    client_host = request.client.host if request.client else "unknown"
+    identity = f"api-key:{api_key}" if api_key else f"ip:{client_host}"
+    now = time.monotonic()
+    window = int(now // RATE_LIMIT_WINDOW_SECONDS)
+    stored_window, count = rate_limit_windows.get(identity, (window, 0))
+
+    if stored_window != window:
+        stored_window = window
+        count = 0
+
+    if count >= RATE_LIMIT_PER_MINUTE:
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"detail": "Rate limit exceeded. Try again later."},
+            headers={"Retry-After": str(RATE_LIMIT_WINDOW_SECONDS)},
+        )
+
+    rate_limit_windows[identity] = (stored_window, count + 1)
+    return await call_next(request)
+
+
 @app.exception_handler(VerificationFailedException)
 def verification_failed_exception_handler(request, exc: VerificationFailedException):
     return JSONResponse(
         status_code=status.HTTP_400_BAD_REQUEST,
         content={"detail": f"Verification failed: {exc.message}"},
+    )
+
+
+@app.exception_handler(AuditLogFailedException)
+def audit_log_failed_exception_handler(request, exc: AuditLogFailedException):
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": f"Audit logging failed: {exc.message}"},
     )
 
 
@@ -161,8 +217,39 @@ def build_user_response(user: models.User) -> UserRead:
     return UserRead(id=user.id, name=user.name)
 
 
+def build_organization_response(org: models.Organization | None) -> OrganizationRead | None:
+    if org is None:
+        return None
+    return OrganizationRead(id=org.id, name=org.name)
+
+
+def build_expert_response(user: models.User) -> ExpertRead:
+    return ExpertRead(
+        id=user.id,
+        name=user.name,
+        signing_public_key=user.signing_public_key,
+        organization=build_organization_response(user.organization),
+    )
+
+
+def build_created_expert_response(user: models.User) -> ExpertCreatedRead:
+    return ExpertCreatedRead(
+        id=user.id,
+        name=user.name,
+        api_key=user.api_key,
+        signing_public_key=user.signing_public_key,
+        organization=build_organization_response(user.organization),
+    )
+
+
 def build_clause_response(clause: models.Clause) -> ClauseRead:
     current_hash = sha256_text(clause.text)
+
+    # Verify using Fabric client
+    from .fabric_client import FabricClient
+    client = FabricClient()
+    ledger_clause = client.get_clause(clause.contract_id, clause.label)
+    stored_hash = ledger_clause["sha256_hash"] if ledger_clause else clause.sha256_hash
 
     return ClauseRead(
         id=clause.id,
@@ -170,9 +257,9 @@ def build_clause_response(clause: models.Clause) -> ClauseRead:
         position=clause.position,
         label=clause.label,
         text=clause.text,
-        stored_hash=clause.sha256_hash,
+        stored_hash=stored_hash,
         current_hash=current_hash,
-        verified=current_hash == clause.sha256_hash,
+        verified=current_hash == stored_hash,
     )
 
 
@@ -275,6 +362,13 @@ def ensure_text_is_not_blank(text: str, detail: str) -> str:
     return cleaned_text
 
 
+def clean_optional_label(label: str | None, fallback: str) -> str:
+    cleaned_label = (label or "").strip()
+    if not cleaned_label:
+        cleaned_label = fallback
+    return cleaned_label[:255]
+
+
 def next_contract_position(contract_id: int, db: Session) -> int:
     highest_clause_position = (
         db.query(func.max(models.Clause.position))
@@ -320,7 +414,12 @@ def ensure_position_is_available(contract_id: int, position: int, db: Session) -
 def tally_proposal(proposal_id: int) -> None:
     db = SessionLocal()
     try:
-        proposal = db.get(models.Proposal, proposal_id)
+        proposal = (
+            db.query(models.Proposal)
+            .filter(models.Proposal.id == proposal_id)
+            .with_for_update()
+            .one_or_none()
+        )
         if proposal is None or proposal.status != PROPOSAL_PENDING:
             return
 
@@ -340,6 +439,17 @@ def tally_proposal(proposal_id: int) -> None:
             db.add(clause)
             db.flush()
 
+            # Store in Fabric blockchain
+            from .fabric_client import FabricClient
+            client = FabricClient()
+            client.store_clause(
+                contract_id=clause.contract_id,
+                position=clause.position,
+                label=clause.label,
+                text=clause.text,
+                sha256_hash=clause.sha256_hash
+            )
+
             proposal.status = PROPOSAL_APPROVED
             proposal.stored_clause_id = clause.id
             proposal.decided_at = datetime.now(timezone.utc)
@@ -353,7 +463,10 @@ def tally_proposal(proposal_id: int) -> None:
 
 
 @app.get("/experts", response_model=list[ExpertRead])
-def list_experts(db: Session = Depends(get_db)) -> list[ExpertRead]:
+def list_experts(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[ExpertRead]:
     users = (
         db.query(models.User)
         .filter(models.User.is_active.is_(True))
@@ -361,15 +474,7 @@ def list_experts(db: Session = Depends(get_db)) -> list[ExpertRead]:
         .all()
     )
 
-    return [
-        ExpertRead(
-            id=user.id,
-            name=user.name,
-            api_key=user.api_key,
-            signing_public_key=user.signing_public_key,
-        )
-        for user in users
-    ]
+    return [build_expert_response(user) for user in users]
 
 
 @app.get("/crypto/public-key", response_model=ElectionPublicKeyRead)
@@ -421,7 +526,11 @@ def create_contract(
 
 
 @app.get("/contract/{contract_id}", response_model=ContractRead)
-def get_contract(contract_id: int, db: Session = Depends(get_db)) -> ContractRead:
+def get_contract(
+    contract_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ContractRead:
     contract = db.get(models.Contract, contract_id)
     if contract is None:
         raise HTTPException(
@@ -455,7 +564,7 @@ def propose_standalone_clause(
         contract_id=contract.id,
         proposed_by_id=current_user.id,
         position=1,
-        label=payload.label,
+        label=clean_optional_label(payload.label, "clause_1"),
         text=clause_text,
     )
     db.add(proposal)
@@ -494,7 +603,7 @@ def propose_contract_clause(
         contract_id=contract.id,
         proposed_by_id=current_user.id,
         position=position,
-        label=payload.label or f"clause_{position}",
+        label=clean_optional_label(payload.label, f"clause_{position}"),
         text=clause_text,
     )
     db.add(proposal)
@@ -507,6 +616,7 @@ def propose_contract_clause(
 @app.get("/proposals", response_model=list[ProposalRead])
 def list_proposals(
     proposal_status: ProposalStatus | None = Query(default=None, alias="status"),
+    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[ProposalRead]:
     query = db.query(models.Proposal).order_by(models.Proposal.created_at.desc())
@@ -520,7 +630,11 @@ def list_proposals(
 
 
 @app.get("/proposal/{proposal_id}", response_model=ProposalRead)
-def get_proposal(proposal_id: int, db: Session = Depends(get_db)) -> ProposalRead:
+def get_proposal(
+    proposal_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ProposalRead:
     proposal = db.get(models.Proposal, proposal_id)
     if proposal is None:
         raise HTTPException(
@@ -586,6 +700,7 @@ def vote_on_proposal(
             payload.ciphertext.c1,
             payload.ciphertext.c2,
         )
+        validate_binary_vote_ciphertext(ciphertext)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -634,27 +749,44 @@ def vote_on_proposal(
             detail="Expert has already submitted a vote for this proposal.",
         )
 
-    db.add(
-        models.Vote(
-            proposal_id=proposal_id,
-            user_id=current_user.id,
-            ciphertext_c1=str(ciphertext.c1),
-            ciphertext_c2=str(ciphertext.c2),
-            signature=payload.signature,
-            signature_public_key=signing_public_key,
-            signature_digest=signed_vote_digest,
-        )
+    vote = models.Vote(
+        proposal_id=proposal_id,
+        user_id=current_user.id,
+        ciphertext_c1=str(ciphertext.c1),
+        ciphertext_c2=str(ciphertext.c2),
+        signature=payload.signature,
+        signature_public_key=signing_public_key,
+        signature_digest=signed_vote_digest,
     )
-
-    db.commit()
+    db.add(vote)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Duplicate vote payload or expert vote for this proposal.",
+        ) from exc
     db.refresh(proposal)
-    background_tasks.add_task(tally_proposal, proposal.id)
+    db.refresh(vote)
+
+    # Publish vote event to RabbitMQ, or fallback to background_task
+    from .queue_manager import is_rabbitmq_online, publish_vote
+    queued = False
+    if is_rabbitmq_online():
+        queued = publish_vote(proposal.id, current_user.id, vote.id)
+    if not queued:
+        background_tasks.add_task(tally_proposal, proposal.id)
 
     return build_proposal_response(proposal, db)
 
 
 @app.get("/clause/{clause_id}", response_model=ClauseRead)
-def get_clause(clause_id: int, db: Session = Depends(get_db)) -> ClauseRead:
+def get_clause(
+    clause_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ClauseRead:
     clause = db.get(models.Clause, clause_id)
     if clause is None:
         raise HTTPException(
@@ -665,10 +797,74 @@ def get_clause(clause_id: int, db: Session = Depends(get_db)) -> ClauseRead:
     return build_clause_response(clause)
 
 
+@app.post(
+    "/organization",
+    response_model=OrganizationRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_organization(
+    payload: OrganizationCreate,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> OrganizationRead:
+    name = ensure_text_is_not_blank(
+        payload.name,
+        "Organization name cannot be blank.",
+    )
+    existing = db.query(models.Organization).filter(models.Organization.name == name).one_or_none()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Organization with name {name} already exists."
+        )
+    org = models.Organization(name=name)
+    db.add(org)
+    db.commit()
+    db.refresh(org)
+    return OrganizationRead(id=org.id, name=org.name)
+
+
+@app.post(
+    "/organization/{org_id}/nominate",
+    response_model=ExpertCreatedRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def nominate_expert(
+    org_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ExpertCreatedRead:
+    org = db.get(models.Organization, org_id)
+    if org is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Organization not found."
+        )
+    
+    # Generate a unique nominee name
+    random_suffix = secrets.token_hex(4)
+    nominee_name = f"nominee-{org.name}-{random_suffix}"
+    api_key = f"lexledger-nominee-{random_suffix}-key"
+    signing_public_key = signing_public_key_for_api_key(api_key)
+
+    user = models.User(
+        name=nominee_name,
+        api_key=api_key,
+        signing_public_key=signing_public_key,
+        organization_id=org.id,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    return build_created_expert_response(user)
+
+
 @app.post("/contract/{contract_id}/query", response_model=ContractQueryResponse)
 def query_contract(
     contract_id: int,
     payload: ContractQueryRequest,
+    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ContractQueryResponse:
     contract = db.get(models.Contract, contract_id)
@@ -679,7 +875,7 @@ def query_contract(
         )
 
     try:
-        response_text, retrieved_clauses_db, verified = run_contract_query(
+        response_text, retrieved_clauses_db, verified, audit_log_id, response_hash = run_contract_query(
             contract_id=contract_id,
             query=payload.query,
             db=db,
@@ -690,10 +886,61 @@ def query_contract(
             detail=str(exc),
         )
 
+    encrypted_response = None
+    ephemeral_public_key = None
+    if payload.public_key:
+        try:
+            from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+            from cryptography.fernet import Fernet
+            from cryptography.hazmat.primitives import serialization
+            import base64
+            import hashlib
+
+            server_priv = X25519PrivateKey.generate()
+            server_pub = server_priv.public_key()
+
+            peer_pub_bytes = base64.b64decode(payload.public_key, validate=True)
+            peer_pub = X25519PublicKey.from_public_bytes(peer_pub_bytes)
+
+            shared_secret = server_priv.exchange(peer_pub)
+            derived_key = hashlib.sha256(shared_secret).digest()
+            fernet_key = base64.urlsafe_b64encode(derived_key)
+
+            f = Fernet(fernet_key)
+            encrypted_response = f.encrypt(response_text.encode("utf-8")).decode("ascii")
+
+            server_pub_bytes = server_pub.public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw
+            )
+            ephemeral_public_key = base64.b64encode(server_pub_bytes).decode("ascii")
+            
+            response_text = "[Encrypted Response]"
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to encrypt response: {e}"
+            )
+
+    signature_payload = {
+        "audit_log_id": audit_log_id,
+        "contract_id": contract_id,
+        "encrypted_response": encrypted_response,
+        "ephemeral_public_key": ephemeral_public_key,
+        "query": payload.query,
+        "response_hash": response_hash,
+        "verified": verified,
+    }
+
     return ContractQueryResponse(
         query=payload.query,
         response=response_text,
         verified=verified,
         retrieved_clauses=[build_clause_response(clause) for clause in retrieved_clauses_db],
+        encrypted_response=encrypted_response,
+        ephemeral_public_key=ephemeral_public_key,
+        response_hash=response_hash,
+        response_signature=sign_response_payload(signature_payload),
+        response_signature_public_key=response_signing_public_key_text(),
+        audit_log_id=audit_log_id,
     )
-

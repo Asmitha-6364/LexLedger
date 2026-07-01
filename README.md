@@ -4,17 +4,20 @@ Simple contract proposal, encrypted voting, storage, and verification API.
 
 ## Run PostgreSQL
 
+Create a local `.env` from `.env.example` and replace the placeholder secrets,
+then start the local services:
+
 ```powershell
 docker compose up -d
 ```
 
-The default API database URL is:
+The API reads service credentials from `.env` / environment variables. For
+local development, `DATABASE_URL`, `REDIS_URL`, and `RABBITMQ_URL` should match
+the credentials used by Docker Compose.
 
-```text
-postgresql+psycopg://lexledger:lexledger@localhost:5432/lexledger
-```
-
-Override it with `DATABASE_URL` if needed.
+If `POSTGRES_PASSWORD`, `REDIS_PASSWORD`, or `RABBITMQ_DEFAULT_PASS` are missing,
+the app warns and only falls back to insecure local-development defaults where a
+fallback exists.
 
 ## Run the API
 
@@ -97,13 +100,15 @@ Fetch the approved proposal. It will include `status: "approved"` and a
 not plain choices:
 
 ```powershell
-curl.exe http://127.0.0.1:8000/proposal/1
+curl.exe http://127.0.0.1:8000/proposal/1 `
+  -H "X-API-Key: lexledger-expert-alice-key"
 ```
 
 Fetch and verify the stored clause:
 
 ```powershell
-curl.exe http://127.0.0.1:8000/clause/1
+curl.exe http://127.0.0.1:8000/clause/1 `
+  -H "X-API-Key: lexledger-expert-alice-key"
 ```
 
 Create a full contract. Its clauses become pending proposals first; they are not
@@ -119,16 +124,23 @@ curl.exe -X POST http://127.0.0.1:8000/contract `
 Fetch a full contract, including both stored clauses and proposals:
 
 ```powershell
-curl.exe http://127.0.0.1:8000/contract/1
+curl.exe http://127.0.0.1:8000/contract/1 `
+  -H "X-API-Key: lexledger-expert-alice-key"
 ```
 
 List all proposals, or only pending proposals:
 
 ```powershell
-curl.exe http://127.0.0.1:8000/proposals
-curl.exe "http://127.0.0.1:8000/proposals?status=pending"
+curl.exe http://127.0.0.1:8000/proposals `
+  -H "X-API-Key: lexledger-expert-alice-key"
+curl.exe "http://127.0.0.1:8000/proposals?status=pending" `
+  -H "X-API-Key: lexledger-expert-alice-key"
 ```
 
 To test tamper detection, edit a clause's `text` value directly in PostgreSQL,
 then call `GET /contract/{id}` or `GET /clause/{id}` again. The response will
 show `verified: false` for the modified clause.
+
+`GET /experts` requires `X-API-Key` and returns expert names, organizations, and
+signing public keys, but it does not return API keys. Nomination responses return
+the newly generated API key once so the caller can hand it to that expert.

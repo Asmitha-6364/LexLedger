@@ -18,6 +18,14 @@ from fastapi.testclient import TestClient
 from app.main import app
 import file_integrity
 
+EXPERT_KEYS = {
+    "expert-alice": "lexledger-expert-alice-key",
+    "expert-bob": "lexledger-expert-bob-key",
+    "expert-carol": "lexledger-expert-carol-key",
+}
+AUTH_HEADERS = {"X-API-Key": EXPERT_KEYS["expert-alice"]}
+
+
 def run_cmd(args):
     result = subprocess.run(
         [".\\.venv\\Scripts\\python.exe"] + args,
@@ -74,25 +82,45 @@ def test_build_2():
     # Load manifest and verify structure
     with open(manifest_file, "r", encoding="utf-8") as f:
         manifest = json.load(f)
-        
-    print(f"[OK] Manifest contains {len(manifest)} clauses:")
-    for clause_id, clause_hash in manifest.items():
+    
+    assert "__root_hash__" in manifest, "Manifest is missing __root_hash__ integrity signature"
+    from file_integrity import calculate_root_hash
+    computed_root = calculate_root_hash(manifest)
+    assert manifest["__root_hash__"] == computed_root, "Manifest root hash signature verification failed"
+    print(f"[OK] Manifest root hash verified: {computed_root}")
+    
+    manifest_clean = {k: v for k, v in manifest.items() if not k.startswith("__")}
+    print(f"[OK] Manifest contains {len(manifest_clean)} clauses:")
+    for clause_id, clause_hash in manifest_clean.items():
         print(f"  - {clause_id}: {clause_hash}")
         assert len(clause_hash) == 64, f"Invalid SHA-256 hash length for {clause_id}"
         
-    assert "clause_1_payment_terms" in manifest
-    assert "clause_2_termination" in manifest
+    assert "clause_1_payment_terms" in manifest_clean
+    assert "clause_2_termination" in manifest_clean
     print("[OK] Build 2 Manifest verification passed.")
 
 def test_build_3_4_5():
     print("\n--- Verifying Builds 3, 4, and 5: REST API, Voting, and Encryption ---")
     with TestClient(app) as client:
+        # Clean up any nominees from earlier tests to isolate database state
+        from app.database import SessionLocal
+        from app import models
+        db = SessionLocal()
+        try:
+            db.query(models.User).filter(~models.User.name.in_(["expert-alice", "expert-bob", "expert-carol"])).delete(synchronize_session=False)
+            db.query(models.Organization).delete(synchronize_session=False)
+            db.commit()
+        finally:
+            db.close()
+
         # 1. Verify simulated experts are seeded
-        response = client.get("/experts")
+        response = client.get("/experts", headers=AUTH_HEADERS)
         assert response.status_code == 200
         experts = response.json()
         assert len(experts) == 3, f"Expected 3 experts, found {len(experts)}"
-        expert_map = {e["name"]: e["api_key"] for e in experts}
+        assert all("api_key" not in expert for expert in experts), "Expert directory leaked API keys"
+        expert_map = EXPERT_KEYS
+        expert_id_map = {e["name"]: e["id"] for e in experts}
         assert "expert-alice" in expert_map
         assert "expert-bob" in expert_map
         assert "expert-carol" in expert_map
@@ -126,6 +154,30 @@ def test_build_3_4_5():
         assert prop["eligible_voter_count"] == 3
         assert prop["approvals_needed"] == 3 # 70% of 3 is 3
         print(f"[OK] Proposal created: ID={proposal_id}, Status={prop['status']}")
+
+        # A signed ciphertext that decrypts outside 0/1 must be rejected before storage.
+        from app.crypto import ElGamalCiphertext, election_public_key, sign_vote, simulated_expert_private_key
+        bad_ciphertext = ElGamalCiphertext(
+            c1=1,
+            c2=pow(election_public_key().g, 5, election_public_key().p),
+        )
+        bad_signature = sign_vote(
+            proposal_id=proposal_id,
+            user_id=expert_id_map["expert-alice"],
+            ciphertext=bad_ciphertext,
+            private_key=simulated_expert_private_key(expert_map["expert-alice"]),
+        )
+        bad_vote_resp = client.post(
+            f"/proposal/{proposal_id}/vote",
+            json={
+                "ciphertext": {"c1": str(bad_ciphertext.c1), "c2": str(bad_ciphertext.c2)},
+                "signature": bad_signature,
+            },
+            headers={"X-API-Key": expert_map["expert-alice"]},
+        )
+        assert bad_vote_resp.status_code == 422
+        assert "binary" in bad_vote_resp.json()["detail"]
+        print("[OK] Malformed encrypted vote rejected before tallying.")
         
         # 4. Cast votes
         # Expert Alice: Approve
@@ -172,10 +224,16 @@ def test_build_3_4_5():
         )
         assert vote_resp.status_code == 200
         
-        # Fetch the proposal again so that the background task has executed and updated the status
-        get_resp = client.get(f"/proposal/{proposal_id}")
-        assert get_resp.status_code == 200
-        prop_after = get_resp.json()
+        # Fetch the proposal again so that the background task has executed and updated the status (with polling for async queue processing)
+        import time
+        prop_after = {}
+        for _ in range(50):
+            get_resp = client.get(f"/proposal/{proposal_id}", headers=AUTH_HEADERS)
+            assert get_resp.status_code == 200
+            prop_after = get_resp.json()
+            if prop_after["status"] == "approved":
+                break
+            time.sleep(0.1)
         
         # Verify proposal is now approved
         assert prop_after["status"] == "approved"
@@ -185,7 +243,7 @@ def test_build_3_4_5():
         
         # 5. Fetch and verify the stored clause
         clause_id = prop_after["stored_clause_id"]
-        clause_resp = client.get(f"/clause/{clause_id}")
+        clause_resp = client.get(f"/clause/{clause_id}", headers={"X-API-Key": expert_map["expert-alice"]})
         assert clause_resp.status_code == 200
         clause = clause_resp.json()
         assert clause["verified"] is True
@@ -202,7 +260,7 @@ def test_build_3_4_5():
             )
             
         # Query `/clause/{id}` again and check verification
-        clause_resp = client.get(f"/clause/{clause_id}")
+        clause_resp = client.get(f"/clause/{clause_id}", headers={"X-API-Key": expert_map["expert-alice"]})
         assert clause_resp.status_code == 200
         clause = clause_resp.json()
         assert clause["verified"] is False
@@ -265,7 +323,7 @@ def test_build_3_4_5():
         assert vote_resp.status_code == 200
         
         # Fetch the proposal again so that the background task has executed and updated the status
-        get_resp = client.get(f"/proposal/{prop2_id}")
+        get_resp = client.get(f"/proposal/{prop2_id}", headers=AUTH_HEADERS)
         assert get_resp.status_code == 200
         prop2_after = get_resp.json()
         
@@ -275,11 +333,11 @@ def test_build_3_4_5():
         print(f"[OK] Rejection logic verified: Proposal status={prop2_after['status']}, Clause stored={prop2_after['stored_clause_id']}")
 
 def test_build_6():
-    print("\n--- Verifying Build 6: Simple Blockchain from Scratch ---")
+    print("\n--- Verifying Build 10: Full System Integration ---")
     result = run_cmd(["run_blockchain_demo.py"])
-    assert result.returncode == 0, f"Blockchain demo execution failed: {result.stderr}"
+    assert result.returncode == 0, f"Full system integration E2E demo failed: {result.stderr}"
     print(result.stdout)
-    print("[OK] Blockchain verification successfully passed all assertions.")
+    print("[OK] Full system integration verification successfully passed all assertions.")
 
 def test_build_7():
     print("\n--- Verifying Build 7: Basic RAG Pipeline for Contract Querying ---")
@@ -306,11 +364,23 @@ def test_build_7():
 def test_build_8():
     print("\n--- Verifying Build 8: Connect Hash Verification to RAG Pipeline ---")
     with TestClient(app) as client:
+        # Clean up any nominees from earlier tests to isolate Build 8 threshold calculations
+        from app.database import SessionLocal
+        from app import models
+        db = SessionLocal()
+        try:
+            db.query(models.User).filter(~models.User.name.in_(["expert-alice", "expert-bob", "expert-carol"])).delete(synchronize_session=False)
+            db.query(models.Organization).delete(synchronize_session=False)
+            db.commit()
+        finally:
+            db.close()
+
         # Get experts to approve a new contract
-        response = client.get("/experts")
+        response = client.get("/experts", headers=AUTH_HEADERS)
         assert response.status_code == 200
         experts = response.json()
-        expert_map = {e["name"]: e["api_key"] for e in experts}
+        assert all("api_key" not in expert for expert in experts), "Expert directory leaked API keys"
+        expert_map = EXPERT_KEYS
         
         # 1. Create a contract clause proposal
         proposal_data = {
@@ -364,16 +434,23 @@ def test_build_8():
             headers={"X-API-Key": expert_map["expert-carol"]}
         )
         
-        # Fetch proposal to ensure it is approved and clause is stored
-        get_resp = client.get(f"/proposal/{proposal_id}")
-        assert get_resp.status_code == 200
-        prop_after = get_resp.json()
+        # Fetch proposal to ensure it is approved and clause is stored (with polling for async queue processing)
+        import time
+        prop_after = {}
+        for _ in range(50):
+            get_resp = client.get(f"/proposal/{proposal_id}", headers=AUTH_HEADERS)
+            assert get_resp.status_code == 200
+            prop_after = get_resp.json()
+            if prop_after["status"] == "approved":
+                break
+            time.sleep(0.1)
+            
         assert prop_after["status"] == "approved"
         clause_id = prop_after["stored_clause_id"]
         assert clause_id is not None
         
         # Get the contract ID of this stored clause
-        clause_resp = client.get(f"/clause/{clause_id}")
+        clause_resp = client.get(f"/clause/{clause_id}", headers={"X-API-Key": expert_map["expert-alice"]})
         assert clause_resp.status_code == 200
         clause = clause_resp.json()
         contract_id = clause["contract_id"]
@@ -382,7 +459,8 @@ def test_build_8():
         query_data = {"query": "what are the payment terms?"}
         query_resp = client.post(
             f"/contract/{contract_id}/query",
-            json=query_data
+            json=query_data,
+            headers={"X-API-Key": expert_map["expert-alice"]}
         )
         assert query_resp.status_code == 200
         result = query_resp.json()
@@ -409,7 +487,8 @@ def test_build_8():
         # 6. Query the contract via the API endpoint when it is tampered
         query_resp_tampered = client.post(
             f"/contract/{contract_id}/query",
-            json=query_data
+            json=query_data,
+            headers={"X-API-Key": expert_map["expert-alice"]}
         )
         assert query_resp_tampered.status_code == 400
         err_detail = query_resp_tampered.json()
@@ -472,4 +551,3 @@ if __name__ == "__main__":
                 test_db_file.unlink()
             except OSError:
                 pass
-

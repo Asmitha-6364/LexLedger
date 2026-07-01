@@ -72,7 +72,11 @@ def extract_text(path):
     if path.suffix.lower() == ".pdf":
         return extract_text_from_pdf(path)
 
-    return path.read_text(encoding="utf-8")
+    try:
+        return path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        print("[Warning] File is not valid UTF-8. Falling back to Latin-1 encoding, which may alter hash outcomes if byte representations change.")
+        return path.read_text(encoding="latin-1")
 
 
 def normalize_clause_text(text):
@@ -118,6 +122,12 @@ def split_into_clauses(text):
     ]
 
 
+def calculate_root_hash(manifest_dict):
+    clause_keys = sorted([k for k in manifest_dict.keys() if not k.startswith("__")])
+    combined = "".join(f"{k}:{manifest_dict[k]}" for k in clause_keys)
+    return hashlib.sha256(combined.encode("utf-8")).hexdigest()
+
+
 def build_clause_manifest(contract_path):
     contract_text = extract_text(contract_path)
     clauses = split_into_clauses(contract_text)
@@ -130,12 +140,24 @@ def build_clause_manifest(contract_path):
 
 def save_clause_manifest(contract_path, manifest_path):
     manifest = build_clause_manifest(contract_path)
+    root_hash = calculate_root_hash(manifest)
+    manifest["__root_hash__"] = root_hash
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    print(f"Saved {len(manifest)} clause hashes to {manifest_path}")
+    print(f"Saved {len(manifest) - 1} clause hashes to {manifest_path} (Root Hash: {root_hash})")
     return 0
 
 
+def print_local_storage_warning(file_path, hash_path):
+    if hash_path.parent.resolve() == file_path.parent.resolve():
+        print(
+            "SECURITY WARNING: Hash file is stored on the same local filesystem directory as the contract. "
+            "An attacker who can modify the contract can also modify the stored hash. "
+            "For production-grade security, store hashes off-trust-domain (e.g. using the Fabric blockchain ledger)."
+        )
+
+
 def save_hash(file_path, hash_path):
+    print_local_storage_warning(file_path, hash_path)
     file_hash = sha256_file(file_path)
     hash_path.write_text(file_hash + "\n", encoding="utf-8")
     print(f"Saved SHA-256 hash to {hash_path}")
@@ -143,6 +165,7 @@ def save_hash(file_path, hash_path):
 
 
 def verify_hash(file_path, hash_path):
+    print_local_storage_warning(file_path, hash_path)
     current_hash = sha256_file(file_path)
     saved_hash = hash_path.read_text(encoding="utf-8").strip()
 
